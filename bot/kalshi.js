@@ -121,17 +121,50 @@ class KalshiClient {
 
   async get(apiPath) {
     const auth = this.generateAuth('GET', apiPath);
-    return axios.get(`${this.baseUrl}${apiPath}`, { ...auth, timeout: 8000 });
+    return this._requestWithRetry('GET', apiPath, auth, null);
   }
 
   async post(apiPath, body) {
     const auth = this.generateAuth('POST', apiPath);
-    return axios.post(`${this.baseUrl}${apiPath}`, body, { ...auth, timeout: 8000 });
+    return this._requestWithRetry('POST', apiPath, auth, body);
   }
 
   async delete(apiPath) {
     const auth = this.generateAuth('DELETE', apiPath);
-    return axios.delete(`${this.baseUrl}${apiPath}`, { ...auth, timeout: 8000 });
+    return this._requestWithRetry('DELETE', apiPath, auth, null);
+  }
+
+  /**
+   * Execute an authenticated request with exponential-backoff retry on
+   * 429 (rate limited) responses. Kalshi throttles order placement, so a
+   * burst of 3 orders for the same ticker in ~3 seconds triggers this.
+   */
+  async _requestWithRetry(method, apiPath, auth, body, attempt = 0) {
+    const url = `${this.baseUrl}${apiPath}`;
+    const baseDelay = 1000; // 1s, doubles each retry
+    const maxDelay = 30000;  // cap at 30s
+    const maxAttempts = 4;
+
+    try {
+      const opts = { ...auth, timeout: 8000 };
+      if (method === 'GET') return await axios.get(url, opts);
+      if (method === 'POST') return await axios.post(url, body, opts);
+      if (method === 'DELETE') return await axios.delete(url, opts);
+      throw new Error(`Unknown method: ${method}`);
+    } catch (err) {
+      const status = err.response && err.response.status;
+      const isRateLimit = status === 429;
+      const isRetryable = isRateLimit || (status >= 500 && status < 600);
+
+      if (isRetryable && attempt < maxAttempts) {
+        const delay = Math.min(baseDelay * Math.pow(2, attempt), maxDelay);
+        const code = isRateLimit ? 'rate-limited' : `status ${status}`;
+        console.warn(`[KalshiClient] ${code} on ${method} ${apiPath}, retrying in ${delay}ms (attempt ${attempt + 1}/${maxAttempts})`);
+        await new Promise(r => setTimeout(r, delay));
+        return this._requestWithRetry(method, apiPath, auth, body, attempt + 1);
+      }
+      throw err;
+    }
   }
 
   async fetchBalance() {

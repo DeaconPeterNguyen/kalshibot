@@ -22,6 +22,16 @@ class OrderExecutor extends BaseSkill {
 
     this.orderManager = null;
     this.maxPositionSize = 25;
+    // Track recently executed tickers to prevent duplicate orders from the
+    // same scan cycle (Kalshi rate-limits duplicate orders at 429).
+    this._recentExecutions = new Map();
+  }
+
+  _isDuplicate(ticker, windowMs = 5000) {
+    const last = this._recentExecutions.get(ticker);
+    if (last && Date.now() - last < windowMs) return true;
+    this._recentExecutions.set(ticker, Date.now());
+    return false;
   }
 
   async initialize(context) {
@@ -63,6 +73,14 @@ class OrderExecutor extends BaseSkill {
         for (const signal of signals) {
           if (executedCount >= maxPerScan) break;
 
+          // Skip duplicate signals for the same ticker within the same
+          // scan window to avoid Kalshi 429 rate limits.
+          if (this._isDuplicate(signal.ticker)) {
+            console.log(`[OrderExecutor] SKIP DUPLICATE ${signal.ticker} (already executed this scan)`);
+            results.push({ signal: signal.ticker, status: 'skipped', reason: 'duplicate_in_scan' });
+            continue;
+          }
+
           // Final risk check before execution
           const riskCheck = await riskSkill.execute({
             action: 'check-risk',
@@ -70,9 +88,12 @@ class OrderExecutor extends BaseSkill {
           });
 
           if (!riskCheck.success || !riskCheck.approved) {
+            console.log(`[OrderExecutor] RISK BLOCKED ${signal.ticker}: ${riskCheck.reason || 'risk_check_failed'}`);
             results.push({ signal: signal.ticker, status: 'blocked', reason: riskCheck.reason || 'risk_check_failed' });
             continue;
           }
+
+          console.log(`[OrderExecutor] RISK APPROVED ${signal.ticker}: ${signal.contracts} contracts @ ${signal.priceCents}c, cost=${riskCheck.cost}`);
 
           if (lastTicker === signal.ticker) await sleep(100);
 
@@ -127,12 +148,12 @@ class OrderExecutor extends BaseSkill {
         action: 'buy',
         side: signal.side,
         count: signal.contracts,
-        type: 'limit',
+        type: 'market',
         client_order_id: clientOrderId,
+        priceCents: signal.priceCents,
       };
 
-      if (signal.side === 'yes') orderData.yes_price = signal.priceCents;
-      else orderData.no_price = signal.priceCents;
+      // Market orders don't take a price parameter
 
       state.updateIntent({
         status: 'executing',
@@ -142,26 +163,47 @@ class OrderExecutor extends BaseSkill {
 
       console.log(`[OrderExecutor] Executing: ${signal.type} ${signal.ticker} ${signal.side} x${signal.contracts} @ ${signal.priceCents}c | Edge: ${signal.edge.toFixed(1)}%`);
 
-      const order = await kalshiSkill.getClient().placeOrder(orderData);
+      let order;
+      try {
+        order = await kalshiSkill.getClient().placeOrder(orderData);
+      } catch (placeErr) {
+        const detail = placeErr.response
+          ? `${placeErr.response.status} - ${JSON.stringify(placeErr.response.data)}`
+          : placeErr.message;
+        console.error(`[OrderExecutor] placeOrder THREW for ${signal.ticker}: ${detail}`);
+        throw placeErr;
+      }
 
-      console.log(`[OrderExecutor] Order ${order.order_id}: ${order.status} | Filled: ${order.fill_count || 0}/${signal.contracts}`);
+      // DEBUG: log the full Kalshi order response so we can see why it didn't fill
+      if (process.env.DEBUG_ORDERS === 'true') {
+        // Safe JSON conversion with circular reference handling
+        try {
+          console.log(`[OrderExecutor] FULL ORDER RESPONSE for ${order?.order_id || 'unknown'}:`, JSON.stringify({ ...order }, null, 2));
+        } catch (e) {
+          console.log(`[OrderExecutor] FULL ORDER RESPONSE for ${order?.order_id || 'unknown'}: [circular data]`);
+        }
+      }
 
-      // Log order
-      analyticsSkill.logOrderDirect({
-        order_id: order.order_id, client_order_id: clientOrderId,
-        ticker: signal.ticker, side: signal.side, action: 'buy',
-        price_cents: signal.priceCents, count: signal.contracts,
-        status: order.status, fill_count: order.fill_count || 0,
-        taker_fill_cost: order.taker_fill_cost || 0,
-        taker_fees: order.taker_fees || 0, close_time: signal.closeTime,
-      }, signalId);
+      console.log(`[OrderExecutor] Order ${order?.order_id || 'unknown'}: ${order?.status || 'unknown'} | Filled: ${order?.fill_count || 0}/${signal.contracts}`);
+
+      // Log order — only if the API returned a valid order object
+      if (order?.order_id) {
+        analyticsSkill.logOrderDirect({
+          order_id: order.order_id, client_order_id: clientOrderId,
+          ticker: signal.ticker, side: signal.side, action: 'buy',
+          price_cents: signal.priceCents, count: signal.contracts,
+          status: order.status, fill_count: order.fill_count || 0,
+          taker_fill_cost: order.taker_fill_cost || 0,
+          taker_fees: order.taker_fees || 0, close_time: signal.closeTime,
+        }, signalId);
+      }
 
       // Add to pending orders
       const pendingOrder = {
-        orderId: order.order_id, clientOrderId,
+        orderId: order?.order_id || clientOrderId, clientOrderId,
         ticker: signal.ticker, signalType: signal.type,
         side: signal.side, contracts: signal.contracts,
-        fillCount: order.fill_count || 0,
+        fillCount: order?.fill_count || 0,
         priceCents: signal.priceCents, priceDecimal: signal.priceDecimal,
         reservedCost: cost, edge: signal.edge, modelProb: signal.modelProb,
         reason: signal.reason, placedAt: Date.now(),
@@ -203,6 +245,7 @@ class OrderExecutor extends BaseSkill {
       const detail = err.response
         ? `${err.response.status} - ${JSON.stringify(err.response.data)}`
         : err.message;
+      console.error(`[OrderExecutor] EXECUTION FAILED for ${signal.ticker}: ${detail}`);
       return { signal: signal.ticker, status: 'error', error: detail };
     }
   }
