@@ -255,6 +255,12 @@ class KalshiClient {
       self_trade_prevention_type: orderData.self_trade_prevention_type || 'maker',
       time_in_force: orderData.time_in_force
         || (orderData.type === 'market' ? 'immediate_or_cancel' : 'good_till_canceled'),
+      // Force auto-routing by ticker to the exchange that has the market
+      // and available balance. The Kalshi API splits balance across
+      // exchange_index 0-3; omitting exchange_index or setting -1 triggers
+      // auto-routing. Without this, orders default to exchange 0 which may
+      // have insufficient balance even when aggregate balance is sufficient.
+      exchange_index: -1,
     };
 
     // V2 requires `price` on every order, in fixed-point dollars (e.g. "0.61"),
