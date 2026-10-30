@@ -396,7 +396,10 @@ Positions that are not exited via take-profit are held to contract settlement:
 | Authentication | RSA-PSS SHA-256 signature (`timestamp_ms + METHOD + path`) |
 | Market discovery | `GET /trade-api/v2/markets?series_ticker=KXBTC15M&status=open` |
 | Market pricing | `GET /trade-api/v2/markets/{ticker}` |
-| Order placement | `POST /trade-api/v2/portfolio/orders` (limit orders only) |
+| Order placement (V2) | `POST /trade-api/v2/portfolio/events/orders` |
+| Order status (V2 GET) | `GET /trade-api/v2/portfolio/orders/{order_id}` |
+| Order cancel (V2 DELETE) | `DELETE /trade-api/v2/portfolio/events/orders/{order_id}` |
+| Order list | `GET /trade-api/v2/portfolio/orders` |
 | Balance | `GET /trade-api/v2/portfolio/balance` |
 | Price format | Cents (0-100), converted to decimals internally |
 

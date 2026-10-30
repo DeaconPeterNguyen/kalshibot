@@ -2,12 +2,79 @@ const axios = require('axios');
 const crypto = require('crypto');
 const fs = require('fs');
 
+/**
+ * Parse a Kalshi price value into a finite decimal (0-1), or null.
+ * Handles both decimal-dollar strings ("0.1100") and integer cents (11).
+ */
+function parsePrice(value) {
+  if (value == null) return null;
+  const n = parseFloat(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Normalize a raw Kalshi market record into the shape the bot consumes
+ * (decimal probabilities + cent fields), regardless of which API field
+ * naming convention the response uses.
+ *
+ * Kalshi renamed its price fields: modern responses carry `yes_bid_dollars`
+ * / `yes_ask_dollars` / `no_bid_dollars` / `no_ask_dollars` / `last_price_dollars`
+ * (decimal strings), while older responses used bare `yes_bid` / `yes_ask` /
+ * `no_bid` / `no_ask` / `last_price` (integer cents). Reading the old names
+ * from a new response returns undefined, which propagates as NaN into the
+ * UI and every strategy calculation — so both forms must be supported.
+ *
+ * @returns {Object|null} normalized market, or null for an unusable record
+ */
+function normalizeKalshiMarket(m) {
+  if (!m || typeof m !== 'object') return null;
+
+  const yesBidDollars = parsePrice(m.yes_bid_dollars);
+  const yesAskDollars = parsePrice(m.yes_ask_dollars);
+  const noBidDollars = parsePrice(m.no_bid_dollars);
+  const noAskDollars = parsePrice(m.no_ask_dollars);
+  const lastPriceDollars = parsePrice(m.last_price_dollars);
+
+  // Dollar fields win when present; fall back to legacy cent fields / 100.
+  const yesBid = yesBidDollars != null ? yesBidDollars
+    : (m.yes_bid != null ? m.yes_bid / 100 : null);
+  const yesAsk = yesAskDollars != null ? yesAskDollars
+    : (m.yes_ask != null ? m.yes_ask / 100 : null);
+  const noBid = noBidDollars != null ? noBidDollars
+    : (m.no_bid != null ? m.no_bid / 100 : null);
+  const noAsk = noAskDollars != null ? noAskDollars
+    : (m.no_ask != null ? m.no_ask / 100 : null);
+  const lastPrice = lastPriceDollars != null ? lastPriceDollars
+    : (m.last_price != null ? m.last_price / 100 : null);
+
+  return {
+    ticker: m.ticker,
+    status: m.status,
+    result: m.result,
+    yesBid,
+    yesAsk,
+    noBid,
+    noAsk,
+    lastPrice,
+    // Cents for the UI and DB snapshot — derive from whichever source we had.
+    yesBidCents: yesBidDollars != null ? Math.round(yesBidDollars * 100) : m.yes_bid,
+    yesAskCents: yesAskDollars != null ? Math.round(yesAskDollars * 100) : m.yes_ask,
+    noBidCents: noBidDollars != null ? Math.round(noBidDollars * 100) : m.no_bid,
+    noAskCents: noAskDollars != null ? Math.round(noAskDollars * 100) : m.no_ask,
+    openTime: m.open_time ? new Date(m.open_time).getTime() : null,
+    closeTime: m.close_time ? new Date(m.close_time).getTime() : null,
+  };
+}
+
 class KalshiClient {
   constructor(config, state) {
     this.config = config;
     this.state = state;
     this.privateKeyPem = null;
-    this.baseUrl = config.KALSHI_API_BASE || 'https://api.elections.kalshi.com';
+    // Per Kalshi docs, the official production REST hostname is
+    // external-api.kalshi.com (trade-api/v2/*). api.elections.kalshi.com is
+    // the consumer site and 404s on every trade-api path.
+    this.baseUrl = config.KALSHI_API_BASE || 'https://external-api.kalshi.com';
   }
 
   loadPrivateKey() {
@@ -97,23 +164,13 @@ class KalshiClient {
   async fetchMarket(ticker) {
     try {
       const resp = await this.get(`/trade-api/v2/markets/${ticker}`);
-      const m = resp.data.market;
-      return {
-        ticker: m.ticker,
-        status: m.status,
-        result: m.result,
-        yesBid: m.yes_bid / 100,
-        yesAsk: m.yes_ask / 100,
-        noBid: m.no_bid / 100,
-        noAsk: m.no_ask / 100,
-        lastPrice: m.last_price / 100,
-        yesBidCents: m.yes_bid,
-        yesAskCents: m.yes_ask,
-        noBidCents: m.no_bid,
-        noAskCents: m.no_ask,
-        openTime: new Date(m.open_time).getTime(),
-        closeTime: new Date(m.close_time).getTime(),
-      };
+      const normalized = normalizeKalshiMarket(resp.data.market);
+      if (!normalized) {
+        const err = new Error(`Unusable market record for ${ticker}`);
+        err.response = resp;
+        throw err;
+      }
+      return normalized;
     } catch (error) {
       if (error.response?.status === 404) return null;
       throw error;
@@ -121,18 +178,100 @@ class KalshiClient {
   }
 
   async placeOrder(orderData) {
-    const resp = await this.post('/trade-api/v2/portfolio/orders', orderData);
-    return resp.data.order;
+    // Kalshi deprecated the V1 order endpoint (/trade-api/v2/portfolio/orders)
+    // with a 410 "deprecated_v1_order_endpoint" error. The V2 order endpoint is
+    // /trade-api/v2/orders and uses `contract_type` ("yes"/"no") instead of
+    // `side` + `yes_price`/`no_price`, and `price` (integer cents) for limits.
+    const v2Data = this._toV2Order(orderData);
+    const url = `${this.baseUrl}/trade-api/v2/portfolio/events/orders`;
+    //const url = `${this.baseUrl}/trade-api/v2/orders`;
+    console.log(`[KalshiClient] POST ${url} body=`, JSON.stringify(v2Data));
+    const resp = await this.post('/trade-api/v2/portfolio/events/orders', v2Data);
+    // /portfolio/events/orders returns the order object at the top level
+    // (with keys like order_id, fill_count, etc.), not wrapped in data.order.
+    if (!resp?.data) {
+      console.warn('[KalshiClient] placeOrder: no order in response', resp?.data);
+      return null;
+    }
+    return resp.data;
   }
 
   async getOrder(orderId) {
+    // The single-order GET lives at /portfolio/orders/{id}, NOT
+    // /portfolio/events/orders/{id} — the events path 404s on every read,
+    // which broke OrderManager polling and settlement checks.
     const resp = await this.get(`/trade-api/v2/portfolio/orders/${orderId}`);
-    return resp.data.order;
+    const order = resp.data.order;
+    // Normalize V2 field names (fill_count_fp -> fill_count, etc.)
+    return this._normalizeOrder(order);
+  }
+
+  _normalizeOrder(order) {
+    if (!order) return order;
+    return {
+      ...order,
+      fill_count: order.fill_count_fp != null ? parseFloat(order.fill_count_fp) : order.fill_count,
+      remaining_count: order.remaining_count_fp != null ? parseFloat(order.remaining_count_fp) : order.remaining_count,
+      initial_count: order.initial_count_fp != null ? parseFloat(order.initial_count_fp) : order.initial_count,
+      taker_fill_cost: order.taker_fill_cost_dollars != null ? parseFloat(order.taker_fill_cost_dollars) : order.taker_fill_cost,
+      taker_fees: order.taker_fees_dollars != null ? parseFloat(order.taker_fees_dollars) : order.taker_fees,
+      maker_fill_cost: order.maker_fill_cost_dollars != null ? parseFloat(order.maker_fill_cost_dollars) : order.maker_fill_cost,
+      maker_fees: order.maker_fees_dollars != null ? parseFloat(order.maker_fees_dollars) : order.maker_fees,
+    };
   }
 
   async cancelOrder(orderId) {
-    const resp = await this.delete(`/trade-api/v2/portfolio/orders/${orderId}`);
+    // V2 cancel endpoint is DELETE /portfolio/events/orders/{order_id}
+    // (same base path as POST /portfolio/events/orders for order creation).
+    // The V1 path /portfolio/orders/{id} returns 410 deprecated_v1_order_endpoint.
+    const resp = await this.delete(`/trade-api/v2/portfolio/events/orders/${orderId}`);
     return resp.data;
+  }
+
+  /**
+   * Translate the bot's order shape to Kalshi's V2 order API body.
+   *
+   * V1: { ticker, action, side, count, type, yes_price?, no_price? }
+   * V2: { ticker, action, contract_type, count, type, price? }
+   */
+  _toV2Order(orderData) {
+    const v2 = {
+      ticker: orderData.ticker,
+      action: orderData.action,
+      contract_type: orderData.side, // 'yes' or 'no'
+      // Kalshi's side is bid/ask: buy-yes or sell-no = bid, buy-no or
+      // sell-yes = ask.
+      side: (orderData.action === 'buy') === (orderData.side === 'yes')
+        ? 'bid' : 'ask',
+      count: String(orderData.count),
+      type: orderData.type,
+      client_order_id: orderData.client_order_id,
+      // Kalshi requires these on every order. self_trade_prevention_type is
+      // 'taker_at_cross' (cancel our taker, stop) or 'maker' (cancel the
+      // resting maker, our taker keeps filling) — 'maker' is what we want
+      // as the entering side. time_in_force: 'immediate_or_cancel' for market
+      // (partial fills OK, remainder cancelled — FoK kills the whole order
+      // when the book can't fully match), 'good_till_canceled' for limit.
+      self_trade_prevention_type: orderData.self_trade_prevention_type || 'maker',
+      time_in_force: orderData.time_in_force
+        || (orderData.type === 'market' ? 'immediate_or_cancel' : 'good_till_canceled'),
+    };
+
+    // V2 requires `price` on every order, in fixed-point dollars (e.g. "0.61"),
+    // not cents. Our callers pass cents (priceCents), so convert; if a value
+    // above 100 is passed it is assumed to already be a dollar decimal.
+    const priceCents = orderData.priceCents != null ? orderData.priceCents
+      : orderData.yes_price != null ? orderData.yes_price
+      : orderData.no_price != null ? orderData.no_price
+      : orderData.price;
+    if (priceCents != null) {
+      const n = Number(priceCents);
+      if (Number.isFinite(n)) {
+        v2.price = (n > 100 ? n : n / 100).toFixed(4);
+      }
+    }
+
+    return v2;
   }
 
   // Fetch actual positions from Kalshi (for reconciliation on startup)
@@ -157,15 +296,15 @@ class KalshiClient {
       action: 'sell',
       side,
       count,
-      type: 'limit',
+      type: 'market',
       client_order_id: `sell-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
+      priceCents: priceCents,
     };
-
-    if (side === 'yes') orderData.yes_price = priceCents;
-    else orderData.no_price = priceCents;
 
     return this.placeOrder(orderData);
   }
 }
 
 module.exports = KalshiClient;
+module.exports.normalizeKalshiMarket = normalizeKalshiMarket;
+module.exports.parsePrice = parsePrice;

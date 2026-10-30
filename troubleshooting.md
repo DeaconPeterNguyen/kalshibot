@@ -38,15 +38,34 @@
 
 ### ❌ Error 404: "Request failed with status code 404"
 
-**Cause**: The contract ticker doesn't exist on Kalshi yet
+**Cause**: Depends heavily on which endpoint returned the 404.
 
-**Why this happens**:
-- Kalshi creates these contracts dynamically
-- The bot is trying to fetch a contract that hasn't been created yet
-- This is NORMAL during the first few minutes
+- **`GET /trade-api/v2/markets/<ticker>`** — the contract genuinely doesn't
+  exist yet. Kalshi creates these contracts dynamically, so this is normal
+  during the first few minutes of a new 15-min window. The bot skips these
+  and discovers the valid ones automatically.
+- **Order placement (`POST /trade-api/v2/portfolio/events/orders`)** —
+  if you get 404, the request is hitting the wrong host.
+  `api.elections.kalshi.com` is the consumer site and 404s on *every*
+  `/trade-api/v2/*` path (orders, balance, markets). The production REST host
+  is `https://external-api.kalshi.com` (see
+  [Kalshi docs](https://docs.kalshi.com/welcome)). If your `KALSHI_API_BASE`
+  is set to anything other than `external-api.kalshi.com`, that's the cause.
+- **Order status check (`GET /trade-api/v2/portfolio/orders/<order_id>`)** —
+  if you get 404, the order ID may be invalid or the order was never created.
+  Note: The V2 single-order GET is at `/portfolio/orders/{id}` (NOT
+  `/portfolio/events/orders/{id}` which 404s on reads).
+- **Order cancellation (`DELETE /trade-api/v2/portfolio/events/orders/<order_id>`)** —
+  if you get 404, the order may already be fully filled/canceled/expired, or
+  the ID is invalid.
 
 **Solution**:
-✅ **This is expected behavior** - the bot will automatically skip these contracts and find valid ones. Just wait 1-2 minutes.
+- Market-data 404s: ✅ expected, wait 1-2 minutes.
+- Order 404s: set `KALSHI_API_BASE=https://external-api.kalshi.com` in
+  `.env` and restart the bot.
+- Single-order GET 404: verify the order ID is correct; use
+  `GET /trade-api/v2/portfolio/orders?limit=100` to list all orders.
+- Cancel 404: order already settled; no action needed.
 
 The bot discovers contracts like:
 - `KXBTC15M-12FEB224500` (future contract, not created yet)
@@ -74,16 +93,21 @@ cat > test-kalshi.js << 'EOF'
 require('dotenv').config();
 const axios = require('axios');
 
+// Easiest path: reuse the bot's own KalshiClient, which already does the
+// RSA-PSS request signing (KALSHI-ACCESS-KEY/SIGNATURE/TIMESTAMP).
+const KalshiClient = require('./bot/kalshi');
+
+const client = new KalshiClient({
+  KALSHI_API_KEY: process.env.KALSHI_API_KEY,
+  KALSHI_PRIVATE_KEY_PATH: process.env.KALSHI_PRIVATE_KEY_PATH || './kalshi_private_key.pem',
+  // Per Kalshi docs, the production REST host is external-api.kalshi.com.
+  KALSHI_API_BASE: process.env.KALSHI_API_BASE || 'https://external-api.kalshi.com',
+}, {});
+
 async function testKalshi() {
   try {
-    const response = await axios.get('https://trading-api.kalshi.com/trade-api/v2/portfolio/balance', {
-      headers: {
-        'Authorization': `Bearer ${process.env.KALSHI_API_KEY}`,
-        'Content-Type': 'application/json'
-      }
-    });
-    
-    console.log('✅ SUCCESS! Balance:', response.data);
+    const balance = await client.fetchBalance();
+    console.log('✅ SUCCESS! Balance:', balance);
   } catch (error) {
     console.log('❌ FAILED:', error.response?.status, error.response?.data || error.message);
   }
@@ -169,7 +193,7 @@ node --version
 ### 📞 Need More Help?
 
 Check the Kalshi API documentation:
-https://trading-api.kalshi.com/
+https://docs.kalshi.com/welcome
 
 Or check your API key status:
 https://kalshi.com/settings/api

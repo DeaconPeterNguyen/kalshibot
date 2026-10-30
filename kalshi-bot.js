@@ -21,12 +21,16 @@ require('dotenv').config();
 const axios = require('axios');
 const crypto = require('crypto');
 const fs = require('fs');
+const { normalizeKalshiMarket } = require('./bot/kalshi');
 
 // Configuration
 const CONFIG = {
   KALSHI_API_KEY: process.env.KALSHI_API_KEY,
   KALSHI_PRIVATE_KEY_PATH: process.env.KALSHI_PRIVATE_KEY_PATH || './kalshi_private_key.pem',
-  KALSHI_API_BASE: 'https://api.elections.kalshi.com',
+  // Per Kalshi docs, the official production REST hostname is
+  // external-api.kalshi.com (trade-api/v2/*). api.elections.kalshi.com is
+  // the consumer site and 404s on every trade-api path.
+  KALSHI_API_BASE: 'https://external-api.kalshi.com',
 
   POLYMARKET_GAMMA_API: 'https://gamma-api.polymarket.com',
   POLYMARKET_CLOB_API: 'https://clob.polymarket.com',
@@ -163,36 +167,30 @@ async function discoverContracts() {
     const newContracts = [];
 
     for (const market of markets) {
-      const closeTime = new Date(market.close_time).getTime();
-      const openTime = new Date(market.open_time).getTime();
+      const normalized = normalizeKalshiMarket(market);
+      if (!normalized) continue;
 
-      // Skip if already expired
-      if (closeTime <= now) continue;
+      const openTime = normalized.openTime;
+      const closeTime = normalized.closeTime;
+      if (!Number.isFinite(closeTime) || closeTime <= now) continue;
 
       // Skip if already tracked
-      if (state.activeContracts.find(c => c.ticker === market.ticker)) continue;
+      if (state.activeContracts.find(c => c.ticker === normalized.ticker)) continue;
 
       const minutesUntilClose = Math.floor((closeTime - now) / 60000);
       const minutesSinceOpen = Math.floor((now - openTime) / 60000);
       const isInTradingWindow = now >= openTime && minutesSinceOpen <= CONFIG.TRADING_WINDOW;
 
       newContracts.push({
-        ticker: market.ticker,
+        ...normalized,
         eventTicker: market.event_ticker,
         title: market.title,
-        openTime,
-        closeTime,
         strikePrice: market.floor_strike,
-        yesBid: market.yes_bid,
-        yesAsk: market.yes_ask,
-        noBid: market.no_bid,
-        noAsk: market.no_ask,
-        lastPrice: market.last_price,
         minutesUntilClose,
         isInTradingWindow,
       });
 
-      log(`Discovered: ${market.ticker} | Strike: $${market.floor_strike?.toFixed(2) || '?'} | YES ${market.yes_bid}/${market.yes_ask} | ${minutesUntilClose}m left`, 'SUCCESS');
+      log(`Discovered: ${normalized.ticker} | Strike: $${market.floor_strike?.toFixed(2) || '?'} | YES ${normalized.yesBidCents}/${normalized.yesAskCents} | ${minutesUntilClose}m left`, 'SUCCESS');
     }
 
     // Merge: keep unexpired, add new
@@ -228,23 +226,13 @@ async function fetchKalshiMarket(ticker) {
   try {
     const apiPath = `/trade-api/v2/markets/${ticker}`;
     const response = await kalshiGet(apiPath);
-    const m = response.data.market;
-
-    return {
-      ticker: m.ticker,
-      status: m.status,
-      // Prices in cents (0-100), convert to probability (0-1)
-      yesBid: m.yes_bid / 100,
-      yesAsk: m.yes_ask / 100,
-      noBid: m.no_bid / 100,
-      noAsk: m.no_ask / 100,
-      lastPrice: m.last_price / 100,
-      strikePrice: m.floor_strike,
-      yesBidCents: m.yes_bid,
-      yesAskCents: m.yes_ask,
-      noBidCents: m.no_bid,
-      noAskCents: m.no_ask,
-    };
+    const normalized = normalizeKalshiMarket(response.data.market);
+    if (!normalized) {
+      log(`Unusable market record for ${ticker}`, 'ERROR');
+      return null;
+    }
+    normalized.strikePrice = response.data.market.floor_strike;
+    return normalized;
   } catch (error) {
     if (error.response?.status === 404) return null;
     log(`Market fetch error for ${ticker}: ${error.response?.status || error.message}`, 'WARN');
@@ -493,20 +481,26 @@ async function executeTrade(signal) {
     const orderData = {
       ticker: signal.contract.ticker,
       action: 'buy',
-      side: signal.side,
-      count: signal.contracts,
-      type: 'limit',
+      contract_type: signal.side, // V2 uses contract_type instead of side
+      // Kalshi's side is bid/ask: buy-yes or sell-no = bid, buy-no or
+      // sell-yes = ask.
+      side: signal.side === 'yes' ? 'bid' : 'ask',
+      count: String(signal.contracts),
+      type: 'market',
       client_order_id: clientOrderId,
+      // Kalshi requires these on every order. self_trade_prevention_type is
+      // 'taker_at_cross' (cancel our taker, stop) or 'maker' (cancel the
+      // resting maker, our taker keeps filling) — 'maker' is what we want
+      // as the entering side. time_in_force: 'fill_or_kill' for market,
+      // 'good_till_canceled' for limit (use expiration_time for a deadline).
+      self_trade_prevention_type: 'maker',
+      time_in_force: 'fill_or_kill',
     };
 
-    // Set price for the side we're buying
-    if (signal.side === 'yes') {
-      orderData.yes_price = signal.priceCents;
-    } else {
-      orderData.no_price = signal.priceCents;
-    }
+    // Market orders don't take a price parameter
 
-    const response = await kalshiPost('/trade-api/v2/portfolio/orders', orderData);
+    const response = await kalshiPost('/trade-api/v2/portfolio/events/orders', orderData);
+    //const response = await kalshiPost('/trade-api/v2/orders', orderData);
     const order = response.data.order;
 
     log(`Order placed: ${order.order_id} | Status: ${order.status} | Filled: ${order.fill_count || 0}/${signal.contracts}`, 'SUCCESS');
@@ -560,6 +554,7 @@ async function settlePosition(position) {
     log(`Checking settlement: ${position.ticker} ${position.side.toUpperCase()}`, 'INFO');
 
     // Check the order status first
+    // V2 single-order GET is /portfolio/orders/{id}, NOT /portfolio/events/orders/{id}
     const orderResp = await kalshiGet(`/trade-api/v2/portfolio/orders/${position.orderId}`);
     const order = orderResp.data.order;
 
