@@ -7,7 +7,7 @@ const mlPipeline = require('../lib/ml-pipeline');
 const supabase = require('../lib/supabase');
 
 module.exports = async (req, res) => {
-  supabase.initialize();
+  await supabase.initialize();
 
   const status = mlPipeline.describe();
   const performance = await supabase.getStrategyPerformance(7);

@@ -26,8 +26,8 @@ class MLSignalScorer extends BaseSkill {
   async initialize(context) {
     await super.initialize(context);
 
-    // Initialize Supabase connection
-    supabase.initialize();
+    // Initialize Supabase connection (and warm the schema cache)
+    await supabase.initialize();
 
     // Attempt to train from existing data
     if (supabase.enabled) {

@@ -6,7 +6,7 @@
 const supabase = require('../lib/supabase');
 
 module.exports = async (req, res) => {
-  supabase.initialize();
+  await supabase.initialize();
 
   const state = await supabase.loadState();
   if (state) {
