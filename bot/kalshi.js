@@ -272,10 +272,12 @@ class KalshiClient {
       ticker: orderData.ticker,
       action: orderData.action,
       contract_type: orderData.side, // 'yes' or 'no'
-      // Kalshi's side is bid/ask: buy-yes or sell-no = bid, buy-no or
-      // sell-yes = ask.
-      side: (orderData.action === 'buy') === (orderData.side === 'yes')
-        ? 'bid' : 'ask',
+      // In Kalshi V2, `side` (bid/ask) is independent of `contract_type`
+      // (yes/no). A buy action is always a bid (you're bidding to buy);
+      // a sell action is always an ask (you're asking to sell).
+      // The old mapping flipped this for buy-no / sell-yes, causing buy
+      // orders to be placed as sell orders that never fill.
+      side: orderData.action === 'buy' ? 'bid' : 'ask',
       count: String(orderData.count),
       type: orderData.type,
       client_order_id: orderData.client_order_id,
