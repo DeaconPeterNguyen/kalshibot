@@ -268,18 +268,55 @@ class KalshiClient {
    * V2: { ticker, action, contract_type, count, type, price? }
    */
   _toV2Order(orderData) {
+    // Kalshi V2 order semantics:
+    //   - side "bid"  = buy  YES contracts
+    //   - side "ask"  = sell YES contracts = buy NO contracts at (1 - price)
+    //   - price is ALWAYS in YES-dollars (0-1), never cents
+    //   - The V2 schema has NO `type` or `contract_type` fields — those are
+    //     V1 concepts. Sending them causes Kalshi to reject or misinterpret
+    //     the order.
+    const isBuyYes = orderData.action === 'buy' && orderData.side === 'yes';
+    const isBuyNo = orderData.action === 'buy' && orderData.side === 'no';
+    const isSellYes = orderData.action === 'sell' && orderData.side === 'yes';
+    const isSellNo = orderData.action === 'sell' && orderData.side === 'no';
+
+    let v2Side;
+    let priceCents;
+    if (isBuyYes) {
+      v2Side = 'bid';
+      priceCents = orderData.priceCents != null ? orderData.priceCents
+        : orderData.yes_price != null ? orderData.yes_price
+        : orderData.price;
+    } else if (isBuyNo) {
+      // Buying NO = selling YES at (1 - noAsk)
+      v2Side = 'ask';
+      const noPriceCents = orderData.priceCents != null ? orderData.priceCents
+        : orderData.no_price != null ? orderData.no_price
+        : orderData.price;
+      // Convert NO-cents price to YES-dollars: 1 - noPrice
+      const noPrice = noPriceCents != null ? Number(noPriceCents) / 100 : null;
+      priceCents = noPrice != null ? (1 - noPrice) * 100 : null;
+    } else if (isSellYes) {
+      v2Side = 'ask';
+      priceCents = orderData.priceCents != null ? orderData.priceCents
+        : orderData.yes_price != null ? orderData.yes_price
+        : orderData.price;
+    } else if (isSellNo) {
+      // Selling NO = buying YES
+      v2Side = 'bid';
+      const noPriceCents = orderData.priceCents != null ? orderData.priceCents
+        : orderData.no_price != null ? orderData.no_price
+        : orderData.price;
+      const noPrice = noPriceCents != null ? Number(noPriceCents) / 100 : null;
+      priceCents = noPrice != null ? (1 - noPrice) * 100 : null;
+    } else {
+      throw new Error(`Unknown order: action=${orderData.action}, side=${orderData.side}`);
+    }
+
     const v2 = {
       ticker: orderData.ticker,
-      action: orderData.action,
-      contract_type: orderData.side, // 'yes' or 'no'
-      // In Kalshi V2, `side` (bid/ask) is independent of `contract_type`
-      // (yes/no). A buy action is always a bid (you're bidding to buy);
-      // a sell action is always an ask (you're asking to sell).
-      // The old mapping flipped this for buy-no / sell-yes, causing buy
-      // orders to be placed as sell orders that never fill.
-      side: orderData.action === 'buy' ? 'bid' : 'ask',
+      side: v2Side,
       count: String(orderData.count),
-      type: orderData.type,
       client_order_id: orderData.client_order_id,
       // Kalshi requires these on every order. self_trade_prevention_type is
       // 'taker_at_cross' (cancel our taker, stop) or 'maker' (cancel the
@@ -301,10 +338,6 @@ class KalshiClient {
     // V2 requires `price` on every order, in fixed-point dollars (e.g. "0.61"),
     // not cents. Our callers pass cents (priceCents), so convert; if a value
     // above 100 is passed it is assumed to already be a dollar decimal.
-    const priceCents = orderData.priceCents != null ? orderData.priceCents
-      : orderData.yes_price != null ? orderData.yes_price
-      : orderData.no_price != null ? orderData.no_price
-      : orderData.price;
     if (priceCents != null) {
       const n = Number(priceCents);
       if (Number.isFinite(n)) {
