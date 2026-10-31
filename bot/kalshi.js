@@ -377,6 +377,21 @@ class KalshiClient {
 
     return this.placeOrder(orderData);
   }
+
+  // Transfer balance between exchange shards (Kalshi V2).
+  // Required before placing orders on an exchange that has 0 balance
+  // but hosts the market.
+  async transferBalance(amountCents, sourceShard = 0, destShard = 2) {
+    const body = {
+      source: 'event_contract',
+      destination: 'event_contract',
+      amount: amountCents * 100, // centicents (cents * 100)
+      source_exchange_shard: sourceShard,
+      destination_exchange_shard: destShard,
+    };
+    const resp = await this.post('/trade-api/v2/portfolio/intra_exchange_instance_transfer', body);
+    return resp.data;
+  }
 }
 
 module.exports = KalshiClient;

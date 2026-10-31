@@ -163,6 +163,30 @@ class OrderExecutor extends BaseSkill {
 
       console.log(`[OrderExecutor] Executing: ${signal.type} ${signal.ticker} ${signal.side} x${signal.contracts} @ ${signal.priceCents}c | Edge: ${signal.edge.toFixed(1)}%`);
 
+      // Ensure balance on the market's exchange shard before placing order
+      const client = kalshiSkill.getClient();
+      const market = state.activeMarkets.find(m => m.ticker === signal.ticker);
+      if (market && market.exchange_index != null) {
+        const shard = market.exchange_index;
+        const costCents = signal.priceCents * signal.contracts;
+        // Check if we have enough balance on that shard
+        const bal = await client.get('/trade-api/v2/portfolio/balance');
+        const breakdown = bal.data.balance_breakdown || [];
+        const shardBalance = breakdown.find(b => b.exchange_index === shard);
+        const availableOnShard = shardBalance ? Math.floor(parseFloat(shardBalance.balance) / 100 * 100) : 0; // cents
+        if (availableOnShard < costCents) {
+          const needCents = costCents - availableOnShard + 100; // add buffer
+          console.log(`[OrderExecutor] Transferring ${needCents}¢ to exchange ${shard} for ${signal.ticker}`);
+          try {
+            await client.transferBalance(needCents, 0, shard);
+            // Small delay for transfer to settle
+            await new Promise(r => setTimeout(r, 500));
+          } catch (transferErr) {
+            console.warn(`[OrderExecutor] Balance transfer failed: ${transferErr.message}`);
+          }
+        }
+      }
+
       let order;
       try {
         order = await kalshiSkill.getClient().placeOrder(orderData);
