@@ -241,15 +241,20 @@ class KalshiClient {
 
   _normalizeOrder(order) {
     if (!order) return order;
+    // Cost fields: V2 API returns dollar strings (e.g. "13.7500").
+    // The engine expects cents (integers) for these fields, so multiply by 100.
+    const toCents = (dollarStr) => dollarStr != null
+      ? Math.round(parseFloat(dollarStr) * 100)
+      : null;
     return {
       ...order,
       fill_count: order.fill_count_fp != null ? parseFloat(order.fill_count_fp) : order.fill_count,
       remaining_count: order.remaining_count_fp != null ? parseFloat(order.remaining_count_fp) : order.remaining_count,
       initial_count: order.initial_count_fp != null ? parseFloat(order.initial_count_fp) : order.initial_count,
-      taker_fill_cost: order.taker_fill_cost_dollars != null ? parseFloat(order.taker_fill_cost_dollars) : order.taker_fill_cost,
-      taker_fees: order.taker_fees_dollars != null ? parseFloat(order.taker_fees_dollars) : order.taker_fees,
-      maker_fill_cost: order.maker_fill_cost_dollars != null ? parseFloat(order.maker_fill_cost_dollars) : order.maker_fill_cost,
-      maker_fees: order.maker_fees_dollars != null ? parseFloat(order.maker_fees_dollars) : order.maker_fees,
+      taker_fill_cost: toCents(order.taker_fill_cost_dollars),
+      taker_fees: toCents(order.taker_fees_dollars),
+      maker_fill_cost: toCents(order.maker_fill_cost_dollars),
+      maker_fees: toCents(order.maker_fees_dollars),
     };
   }
 

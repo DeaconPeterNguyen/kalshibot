@@ -82,7 +82,7 @@ test('getOrder uses /portfolio/orders/{id} (V2 GET), cancelOrder uses /portfolio
   assert.ok(seenDelete.startsWith('/trade-api/v2/portfolio/events/orders/'));
 });
 
-test('getOrder normalizes V2 field names (fill_count_fp -> fill_count, taker_fill_cost_dollars -> taker_fill_cost)', async () => {
+test('getOrder normalizes V2 field names (fill_count_fp -> fill_count, taker_fill_cost_dollars -> taker_fill_cost in cents)', async () => {
   const client = makeClient();
   // The real GET /portfolio/orders/{id} returns V2 field names
   const v2Response = {
@@ -101,7 +101,7 @@ test('getOrder normalizes V2 field names (fill_count_fp -> fill_count, taker_fil
   const order = await client.getOrder('xyz');
 
   // The returned order object should have normalized field names
-  assert.equal(order.fill_count, 12.50); // number, from fill_count_fp
-  assert.equal(order.taker_fill_cost, 6.25); // number, from taker_fill_cost_dollars
-  assert.equal(order.taker_fees, 0.125); // number, from taker_fees_dollars
+  assert.equal(order.fill_count, 12.50); // count as float
+  assert.equal(order.taker_fill_cost, 625); // cost in CENTS (6.2500 * 100)
+  assert.equal(order.taker_fees, 13); // fees in CENTS (0.1250 * 100 = 12.5, rounded to 13)
 });
